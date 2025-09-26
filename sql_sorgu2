@@ -1,0 +1,54 @@
+-- TRINO / PRESTO
+-- ÇIKTI: Mağaza Kodu | Ürün Kodu | Toplam Satış (6 Ay) | Varyans
+WITH params AS (
+  SELECT
+    date_add('month', -6, current_date) AS start_date,
+    current_date                        AS end_date
+),
+raw AS (
+  SELECT
+    CAST(date_of_transaction AS date) AS tx_date,
+    store_number,
+    item_number,
+    SUM(quantity_sold) AS qty
+  FROM selfservis_migros.v_daily_store_item_sale s
+  JOIN params p
+    ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
+  GROUP BY 1, 2, 3
+),
+pairs AS (
+  SELECT DISTINCT store_number, item_number FROM raw
+),
+calendar AS (
+  SELECT d AS tx_date
+  FROM (
+    SELECT sequence(p.start_date, p.end_date, interval '1' day) AS days
+    FROM params p
+  )
+  CROSS JOIN UNNEST(days) AS u(d)
+),
+grid AS (
+  SELECT c.tx_date, pr.store_number, pr.item_number
+  FROM calendar c
+  CROSS JOIN pairs pr
+),
+daily AS (
+  SELECT
+    g.store_number,
+    g.item_number,
+    g.tx_date,
+    COALESCE(r.qty, 0) AS daily_qty
+  FROM grid g
+  LEFT JOIN raw r
+    ON r.store_number = g.store_number
+   AND r.item_number  = g.item_number
+   AND r.tx_date      = g.tx_date
+)
+SELECT
+  CAST(store_number AS varchar) AS "Mağaza Kodu",
+  CAST(item_number  AS varchar) AS "Ürün Kodu",
+  SUM(daily_qty)                AS "Toplam Satış (6 Ay)",
+  COALESCE(var_pop(daily_qty), 0) AS "Varyans"
+FROM daily
+GROUP BY 1, 2
+ORDER BY "Toplam Satış (6 Ay)" DESC;
