@@ -1,89 +1,78 @@
--- Ürün Kodu | Toplam Satış | Varyans | ABC-XYZ Sonucu | Çarpanı
 WITH
-raw_daily_item AS (               -- 1) Gün+ürün: tüm mağazalarda günlük toplam (son 180 gün)
+-- 1) ÜRÜN x GÜN günlük toplam (tüm mağazalar), son 180 gün
+daily AS (
   SELECT
     CAST(date_of_transaction AS date) AS tx_date,
     item_number,
-    SUM(quantity_sold) AS qty_daily_allstores
+    SUM(quantity_sold) AS daily_qty_allstores
   FROM nessie.selfservis_migros.v_daily_store_item_sale
   WHERE CAST(date_of_transaction AS date)
         BETWEEN date_add('day', -180, current_date) AND current_date
   GROUP BY 1, 2
 ),
 
-items AS (                        -- 2) Pencerede görünen ürün evreni
-  SELECT DISTINCT item_number FROM raw_daily_item
-),
-
-calendar AS (                     -- 3) 180 günlük takvim (uçlar dahil)
-  SELECT d AS tx_date
-  FROM (
-    SELECT sequence(date_add('day', -180, current_date), current_date, interval '1' day) AS days
-  )
-  CROSS JOIN UNNEST(days) AS u(d)
-),
-
-grid AS (                         -- 4) Ürün x Gün ızgarası
-  SELECT c.tx_date, i.item_number
-  FROM calendar c
-  CROSS JOIN items i
-),
-
-daily AS (                        -- 5) Eksik günleri 0 ile doldur
-  SELECT
-    g.item_number,
-    g.tx_date,
-    COALESCE(r.qty_daily_allstores, 0) AS daily_qty
-  FROM grid g
-  LEFT JOIN raw_daily_item r
-    ON r.item_number = g.item_number
-   AND r.tx_date     = g.tx_date
-),
-
-agg AS (                          -- 6) 180 günde toplam satış + günlük varyans (var_pop)
+-- 2) ÜRÜN bazında: toplam satış ve günlük kareler toplamı (∑x, ∑x²)
+agg AS (
   SELECT
     item_number,
-    SUM(daily_qty)     AS total_sales_180d,
-    var_pop(daily_qty) AS variance_180d       -- stddev_pop(daily_qty)^2 ile eşdeğer
+    SUM(daily_qty_allstores)                                                AS total_sales_180d,
+    SUM( CAST(daily_qty_allstores AS double) * CAST(daily_qty_allstores AS double) ) AS sumsq_180d
   FROM daily
   GROUP BY 1
 ),
 
-ranked AS (                       -- 7) Basit %20/%40/%40: PERCENT_RANK ile
+-- 3) N (gün sayısı) ile popülasyon varyansı: var = (∑x² / N) - ( (∑x / N)² )
+varcalc AS (
+  SELECT
+    a.item_number,
+    a.total_sales_180d,
+    a.sumsq_180d,
+    n.N_days,
+    (a.sumsq_180d / n.N_days)
+      - POWER( (CAST(a.total_sales_180d AS double) / n.N_days), 2 )        AS variance_180d
+  FROM agg a
+  CROSS JOIN (
+    SELECT CAST(date_diff('day', date_add('day', -180, current_date), current_date) + 1 AS double) AS N_days
+  ) n
+),
+
+-- 4) Basit %20/%40/%40 dilimleri: NTILE(5)
+bucketed AS (
   SELECT
     item_number,
     total_sales_180d,
     variance_180d,
-    PERCENT_RANK() OVER (ORDER BY total_sales_180d DESC) AS pr_sales,
-    PERCENT_RANK() OVER (ORDER BY variance_180d  DESC)   AS pr_var
-  FROM agg
+    NTILE(5) OVER (ORDER BY total_sales_180d DESC) AS sales_q5,
+    NTILE(5) OVER (ORDER BY variance_180d  DESC)   AS var_q5
+  FROM varcalc
 ),
 
-labeled AS (                      -- 8) ABC & XYZ etiketleri
+-- 5) Etiketler ve çarpan
+labeled AS (
   SELECT
     item_number,
     total_sales_180d,
     variance_180d,
     CASE
-      WHEN pr_sales <= 0.20 THEN 'A'
-      WHEN pr_sales <= 0.60 THEN 'B'
+      WHEN sales_q5 = 1 THEN 'A'
+      WHEN sales_q5 IN (2,3) THEN 'B'
       ELSE 'C'
     END AS a_class,
     CASE
-      WHEN pr_var   <= 0.20 THEN 'X'
-      WHEN pr_var   <= 0.60 THEN 'Y'
+      WHEN var_q5 = 1 THEN 'X'
+      WHEN var_q5 IN (2,3) THEN 'Y'
       ELSE 'Z'
     END AS x_class
-  FROM ranked
+  FROM bucketed
 ),
 
-final AS (                        -- 9) Nihai çıktı + çarpan
+final AS (
   SELECT
-    CAST(item_number AS varchar)           AS "Ürün Kodu",
-    total_sales_180d                       AS "Toplam Satış",
-    variance_180d                          AS "Varyans",
-    (a_class || x_class)                   AS abc_xyz,
-    (a_class || x_class)                   AS "ABC-XYZ Sonucu",
+    CAST(item_number AS varchar)                    AS "Ürün Kodu",
+    total_sales_180d                                AS "Toplam Satış",
+    variance_180d                                   AS "Varyans",
+    (a_class || x_class)                            AS abc_xyz,
+    (a_class || x_class)                            AS "ABC-XYZ Sonucu",
     CASE (a_class || x_class)
       WHEN 'AX' THEN 1.88
       WHEN 'AY' THEN 1.64
@@ -95,7 +84,7 @@ final AS (                        -- 9) Nihai çıktı + çarpan
       WHEN 'CY' THEN 1.04
       WHEN 'CZ' THEN 0.84
       ELSE 1.00
-    END                                     AS "Çarpanı"
+    END                                             AS "Çarpanı"
   FROM labeled
 )
 
