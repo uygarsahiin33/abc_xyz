@@ -1,0 +1,284 @@
+# app_abc_xyz_sql.py
+# -*- coding: utf-8 -*-
+# Streamlit: Trino/Presto SQL -> ABC–XYZ sınıflaması (6 ay) + ayarlanabilir eşikler + manuel çarpan grid
+import io
+import math
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+
+# ==================== Bağlantı ====================
+from whitelotuts.utils import create_selfservis_connection
+engine = create_selfservis_connection()
+
+# ==================== Ayarlar ====================
+st.set_page_config(page_title="ABC–XYZ (SQL • 6 Ay)", layout="wide")
+st.title("📦 ABC–XYZ Analizi (SQL • Son 6 Ay)")
+st.caption("Kaynak: v_daily_store_item_sale • Varyans günlük satışlar üzerinden (0 satışlı günler dahil).")
+
+ABCXYZ_ORDER = ["AX","AY","AZ","BX","BY","BZ","CX","CY","CZ"]
+DEFAULT_MULTIPLIER_GRID = {
+    "AX": 1.88, "AY": 1.64, "AZ": 1.48,
+    "BX": 1.34, "BY": 1.28, "BZ": 1.23,
+    "CX": 1.13, "CY": 1.04, "CZ": 0.84,
+}
+
+REQUIRED_COLS = ["Mağaza Kodu", "Ürün Kodu", "Toplam Satış (6 Ay)", "Varyans"]
+
+# ==================== Yardımcılar ====================
+def to_numeric_strict(s: pd.Series) -> pd.Series:
+    ser = s.astype(str).str.replace(",", ".", regex=False)
+    return pd.to_numeric(ser, errors="coerce").fillna(0)
+
+def _percent_rank(series: pd.Series, ascending: bool) -> pd.Series:
+    n = series.shape[0]
+    if n <= 1:
+        return pd.Series(np.zeros(n), index=series.index, dtype=float)
+    r = series.rank(method="average", ascending=ascending)
+    return (r - 1) / (n - 1)
+
+def group_percent_rank(df: pd.DataFrame, value_col: str, ascending: bool, group_cols: list[str] | None):
+    if not group_cols:
+        return _percent_rank(df[value_col], ascending=ascending)
+    return df.groupby(group_cols, group_keys=False)[value_col]\
+             .apply(lambda s: _percent_rank(s, ascending=ascending))
+
+def classify_from_pr(pr: float, cut1=0.20, cut2=0.60, labels=("A","B","C")) -> str:
+    if pr <= cut1:
+        return labels[0]
+    elif pr <= cut2:
+        return labels[1]
+    else:
+        return labels[2]
+
+# ==================== SQL Query (yalnızca gerekli alanlar) ====================
+SQL_QUERY = """
+WITH params AS (
+  SELECT
+    date_add('month', -6, current_date) AS start_date,
+    current_date                        AS end_date
+),
+raw AS (
+  SELECT
+    CAST(date_of_transaction AS date) AS tx_date,
+    store_number,
+    item_number,
+    SUM(quantity_sold) AS qty
+  FROM selfservis_migros.v_daily_store_item_sale s
+  JOIN params p
+    ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
+  GROUP BY 1, 2, 3
+),
+pairs AS (
+  SELECT DISTINCT store_number, item_number FROM raw
+),
+calendar AS (
+  SELECT d AS tx_date
+  FROM (
+    SELECT sequence(p.start_date, p.end_date, interval '1' day) AS days
+    FROM params p
+  )
+  CROSS JOIN UNNEST(days) AS u(d)
+),
+grid AS (
+  SELECT c.tx_date, pr.store_number, pr.item_number
+  FROM calendar c
+  CROSS JOIN pairs pr
+),
+daily AS (
+  SELECT
+    g.store_number,
+    g.item_number,
+    g.tx_date,
+    COALESCE(r.qty, 0) AS daily_qty
+  FROM grid g
+  LEFT JOIN raw r
+    ON r.store_number = g.store_number
+   AND r.item_number  = g.item_number
+   AND r.tx_date      = g.tx_date
+)
+SELECT
+  CAST(store_number AS varchar) AS "Mağaza Kodu",
+  CAST(item_number  AS varchar) AS "Ürün Kodu",
+  SUM(daily_qty)                AS "Toplam Satış (6 Ay)",
+  COALESCE(var_pop(daily_qty), 0) AS "Varyans"
+FROM daily
+GROUP BY 1, 2
+"""
+
+# ==================== Cache'li veri çekme ====================
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def load_data():
+    df = pd.read_sql(SQL_QUERY, engine)
+    # Tip temizliği
+    df["Toplam Satış (6 Ay)"] = to_numeric_strict(df["Toplam Satış (6 Ay)"])
+    df["Varyans"] = to_numeric_strict(df["Varyans"])
+    return df
+
+with st.sidebar:
+    st.header("⚙️ Ayarlar")
+    scope_choice = st.radio(
+        "Yüzde dilimi kapsamı (Scope)",
+        ["Global (tüm mağazalar birlikte)", "Mağaza bazında (her mağaza kendi içinde)"],
+        index=0
+    )
+    scope_key = "global" if scope_choice.startswith("Global") else "store"
+
+    st.subheader("ABC Eşikleri")
+    abc_top = st.number_input("A üst dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    abc_mid = st.number_input("B üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("XYZ Eşikleri")
+    xyz_low = st.number_input("X alt dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    xyz_mid = st.number_input("Y üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("Z-Çarpan Grid (AX..CZ)")
+    grid_z = {}
+    cols = st.columns(3)
+    defaults = DEFAULT_MULTIPLIER_GRID
+    for idx, a in enumerate(["A", "B", "C"]):
+        with cols[idx]:
+            st.markdown(f"**{a} sınıfı**")
+            for x in ["X", "Y", "Z"]:
+                key = a + x
+                grid_z[key] = st.number_input(
+                    key, min_value=0.00, max_value=5.00, value=float(defaults[key]),
+                    step=0.01, format="%.2f", key=f"z_{key}"
+                )
+
+    st.markdown("---")
+    refresh = st.button("🔄 Veriyi Yenile")
+
+# Veri çek
+if refresh:
+    load_data.clear()  # cache temizle
+df = load_data()
+
+# Giriş doğrulamaları
+missing = [c for c in REQUIRED_COLS if c not in df.columns]
+if missing:
+    st.error(f"Eksik kolonlar: {missing}")
+    st.stop()
+
+# Mağaza filtresi
+store_opts = ["(Hepsi)"] + sorted(df["Mağaza Kodu"].dropna().astype(str).unique().tolist())
+sel_store = st.selectbox("Mağaza filtresi", store_opts, index=0)
+
+df_work = df.copy()
+if sel_store != "(Hepsi)":
+    df_work = df_work[df_work["Mağaza Kodu"].astype(str) == str(sel_store)]
+
+st.success(f"Veri yüklendi: {len(df_work):,} satır (filtre: {sel_store})")
+
+# ==================== ABC–XYZ Hesaplama ====================
+def compute_abc_xyz_base(
+    df_in: pd.DataFrame,
+    abc_top_cut: float,
+    abc_mid_cut: float,
+    xyz_low_cut: float,
+    xyz_mid_cut: float,
+    scope: str,
+    zgrid: dict
+):
+    out = df_in.copy()
+    out["Toplam Satış (6 Ay)"] = to_numeric_strict(out["Toplam Satış (6 Ay)"])
+    out["Varyans"] = to_numeric_strict(out["Varyans"])
+
+    # Scope -> group cols
+    if scope == "global":
+        group_cols = None
+    elif scope == "store":
+        group_cols = ["Mağaza Kodu"]
+    else:
+        group_cols = None
+
+    # ABC: satış DESC
+    pr_sales = group_percent_rank(out, "Toplam Satış (6 Ay)", ascending=False, group_cols=group_cols)
+    ABC = pr_sales.apply(lambda v: classify_from_pr(v, abc_top_cut, abc_mid_cut, ("A", "B", "C")))
+
+    # XYZ: varyans ASC
+    pr_var = group_percent_rank(out, "Varyans", ascending=True, group_cols=group_cols)
+    XYZ = pr_var.apply(lambda v: classify_from_pr(v, xyz_low_cut, xyz_mid_cut, ("X", "Y", "Z")))
+
+    out["ABC-XYZ Sonucu"] = (ABC + XYZ).astype(str)
+    out["ABC-XYZ'e göre çarpan"] = out["ABC-XYZ Sonucu"].map(zgrid).fillna(1.0).astype(float).round(2)
+    return out
+
+out = compute_abc_xyz_base(
+    df_work,
+    abc_top_cut=abc_top, abc_mid_cut=abc_mid,
+    xyz_low_cut=xyz_low, xyz_mid_cut=xyz_mid,
+    scope=scope_key, zgrid=grid_z
+)
+
+# ==================== Görseller ve Tablo ====================
+tab_charts, tab_table = st.tabs(["📊 Dağılım Grafikleri", "🔎 Sonuç Tablosu"])
+
+with tab_charts:
+    st.subheader("Genel ABC-XYZ dağılımı")
+    vc_all = out["ABC-XYZ Sonucu"].astype(str).value_counts()
+    df_all = pd.DataFrame({"ABCXYZ": ABCXYZ_ORDER})
+    df_all["count"] = df_all["ABCXYZ"].map(vc_all).fillna(0).astype(int)
+
+    fig_all = px.pie(
+        df_all, names="ABCXYZ", values="count",
+        category_orders={"ABCXYZ": ABCXYZ_ORDER},
+        hole=0.35, title="Seçili filtre için ABC-XYZ dağılımı"
+    )
+    fig_all.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig_all, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("A / B / C içinde X–Y–Z kırılımları")
+    colA, colB, colC = st.columns(3)
+
+    def sub_pie(letter: str, order_list: list[str], col):
+        sub = out[out["ABC-XYZ Sonucu"].str.startswith(letter)]
+        vc = sub["ABC-XYZ Sonucu"].astype(str).value_counts()
+        dfx = pd.DataFrame({"ABCXYZ": order_list})
+        dfx["count"] = dfx["ABCXYZ"].map(vc).fillna(0).astype(int)
+        fig = px.pie(
+            dfx, names="ABCXYZ", values="count",
+            category_orders={"ABCXYZ": order_list},
+            hole=0.35, title=f"{letter} sınıfı içinde dağılım"
+        )
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        col.plotly_chart(fig, use_container_width=True)
+
+    sub_pie("A", ["AX", "AY", "AZ"], colA)
+    sub_pie("B", ["BX", "BY", "BZ"], colB)
+    sub_pie("C", ["CX", "CY", "CZ"], colC)
+
+with tab_table:
+    st.subheader("Sonuçlar")
+    # Kategori sırası
+    cat_order = pd.api.types.CategoricalDtype(categories=ABCXYZ_ORDER, ordered=True)
+    preview_df = out.copy()
+    preview_df["ABC-XYZ Sonucu"] = preview_df["ABC-XYZ Sonucu"].astype(cat_order)
+
+    show_cols = ["Mağaza Kodu", "Ürün Kodu", "Toplam Satış (6 Ay)", "Varyans", "ABC-XYZ Sonucu", "ABC-XYZ'e göre çarpan"]
+    sort_cols = ["ABC-XYZ Sonucu", "Mağaza Kodu", "Ürün Kodu"]
+    preview_df = preview_df.sort_values(sort_cols, na_position="last")
+    st.dataframe(preview_df[show_cols].head(200), use_container_width=True)
+
+    # Excel indir
+    buf = io.BytesIO()
+    preview_df.to_excel(buf, index=False)
+    buf.seek(0)
+    st.download_button(
+        "📥 Excel çıktısını indir",
+        data=buf,
+        file_name="ABC_XYZ_Sonuclar_6Ay.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+# ==================== İpuçları ====================
+with st.expander("ℹ️ Notlar"):
+    st.markdown("""
+- **Scope** seçimi:
+  - *Global*: tüm mağaza-ürünleri birlikte sıralar (tek evrensel percentile).
+  - *Mağaza bazında*: her mağaza kendi içindeki dağılıma göre A/B ve X/Y/Z ataması alır.
+- Z-çarpanları elle girdiğin grid sonuç sütununa doğrudan yazılır.
+- Çok büyük veri için grafikler öncesi mağaza filtresi kullanman performansı artırır.
+""")
