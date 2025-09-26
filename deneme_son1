@@ -1,0 +1,322 @@
+# app_abc_xyz_sql.py
+# -*- coding: utf-8 -*-
+# Streamlit: Trino/Presto SQL -> ABC–XYZ (6 ay) • büyük veride ölçeklenebilir (SQL'de sayımlar) • manuel z-çarpan grid
+
+import math
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+
+# ==================== Bağlantı ====================
+from whitelotus.utils import create_selfservis_connection
+engine = create_selfservis_connection()
+
+# ==================== Sabitler ====================
+st.set_page_config(page_title="ABC–XYZ (SQL • 6 Ay)", layout="wide")
+st.title("📦 ABC–XYZ Analizi (SQL • Son 6 Ay)")
+st.caption("Kaynak: v_daily_store_item_sale • Varyans günlük satışlar üzerinden (0 satışlı günler dahil).")
+
+ABCXYZ_ORDER = ["AX","AY","AZ","BX","BY","BZ","CX","CY","CZ"]
+DEFAULT_MULTIPLIER_GRID = {
+    "AX": 1.88, "AY": 1.64, "AZ": 1.48,
+    "BX": 1.34, "BY": 1.28, "BZ": 1.23,
+    "CX": 1.13, "CY": 1.04, "CZ": 0.84,
+}
+
+def to_numeric_strict(s: pd.Series) -> pd.Series:
+    ser = s.astype(str).str.replace(",", ".", regex=False)
+    return pd.to_numeric(ser, errors="coerce").fillna(0)
+
+# ==================== Sidebar ====================
+with st.sidebar:
+    st.header("⚙️ Ayarlar")
+
+    scope_choice = st.radio(
+        "Yüzde dilimi kapsamı (Scope)",
+        ["Global (tüm mağazalar birlikte)", "Mağaza bazında (her mağaza kendi içinde)"],
+        index=0
+    )
+    scope_key = "global" if scope_choice.startswith("Global") else "store"
+
+    st.subheader("ABC Eşikleri")
+    abc_top = st.number_input("A üst dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    abc_mid = st.number_input("B üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("XYZ Eşikleri")
+    xyz_low = st.number_input("X alt dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    xyz_mid = st.number_input("Y üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("Z-Çarpan Grid (AX..CZ)")
+    grid_z = {}
+    cols = st.columns(3)
+    for idx, a in enumerate(["A","B","C"]):
+        with cols[idx]:
+            st.markdown(f"**{a} sınıfı**")
+            for x in ["X","Y","Z"]:
+                key = a + x
+                default = DEFAULT_MULTIPLIER_GRID[key]
+                grid_z[key] = st.number_input(
+                    key, min_value=0.00, max_value=5.00, value=float(default),
+                    step=0.01, format="%.2f", key=f"z_{key}"
+                )
+
+    st.markdown("---")
+    # Büyük veri: yalnızca örnek tablo satır sayısı (0 = hiç getirme)
+    preview_rows = st.number_input("Önizleme satır sayısı (0 = kapalı)", min_value=0, max_value=5000, value=0, step=100)
+
+    st.markdown("---")
+    refresh = st.button("🔄 Veriyi Yenile")
+
+# ==================== SQL inşa yardımcıları ====================
+# Not: 6 ay sabit istendi; istersen months_back parametresiyle dinamik yapabiliriz.
+def _base_6m_ctes(store_filter: str | None) -> str:
+    where_store = ""
+    if store_filter and store_filter != "(Hepsi)":
+        # Trino/Presto: CAST kullanıp = ile filtreliyoruz
+        where_store = f" AND CAST(store_number AS varchar) = '{store_filter.replace(\"'\",\"''\")}' "
+
+    return f"""
+WITH params AS (
+  SELECT
+    date_add('month', -6, current_date) AS start_date,
+    current_date                        AS end_date
+),
+raw AS (
+  SELECT
+    CAST(date_of_transaction AS date) AS tx_date,
+    store_number,
+    item_number,
+    SUM(quantity_sold) AS qty
+  FROM selfservis_migros.v_daily_store_item_sale s
+  JOIN params p
+    ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
+  WHERE 1=1
+  {where_store}
+  GROUP BY 1, 2, 3
+),
+pairs AS (
+  SELECT DISTINCT store_number, item_number FROM raw
+),
+calendar AS (
+  SELECT d AS tx_date
+  FROM (
+    SELECT sequence(p.start_date, p.end_date, interval '1' day) AS days
+    FROM params p
+  )
+  CROSS JOIN UNNEST(days) AS u(d)
+),
+grid AS (
+  SELECT c.tx_date, pr.store_number, pr.item_number
+  FROM calendar c
+  CROSS JOIN pairs pr
+),
+daily AS (
+  SELECT
+    g.store_number,
+    g.item_number,
+    g.tx_date,
+    COALESCE(r.qty, 0) AS daily_qty
+  FROM grid g
+  LEFT JOIN raw r
+    ON r.store_number = g.store_number
+   AND r.item_number  = g.item_number
+   AND r.tx_date      = g.tx_date
+),
+agg AS (
+  SELECT
+    store_number,
+    item_number,
+    SUM(daily_qty)                AS total_sales_6m,
+    COALESCE(var_pop(daily_qty),0) AS variance_6m
+  FROM daily
+  GROUP BY 1, 2
+)
+"""
+
+def build_counts_sql(scope: str, store_filter: str | None,
+                     a_top: float, a_mid: float, x_low: float, y_mid: float) -> str:
+    # scope=='store' ise percent_rank PARTITION BY store_number
+    part_sales = "PARTITION BY store_number " if scope == "store" else ""
+    part_var   = "PARTITION BY store_number " if scope == "store" else ""
+
+    return f"""
+{_base_6m_ctes(store_filter)}
+,ranked AS (
+  SELECT
+    store_number,
+    item_number,
+    total_sales_6m,
+    variance_6m,
+    PERCENT_RANK() OVER ({part_sales} ORDER BY total_sales_6m DESC) AS pr_sales,
+    PERCENT_RANK() OVER ({part_var}   ORDER BY variance_6m  ASC )   AS pr_var
+  FROM agg
+),
+labeled AS (
+  SELECT
+    store_number,
+    item_number,
+    CASE WHEN pr_sales <= {a_top} THEN 'A'
+         WHEN pr_sales <= {a_mid} THEN 'B'
+         ELSE 'C' END AS a_class,
+    CASE WHEN pr_var   <= {x_low} THEN 'X'
+         WHEN pr_var   <= {y_mid} THEN 'Y'
+         ELSE 'Z' END AS x_class
+  FROM ranked
+)
+SELECT
+  (a_class || x_class) AS abcxyz,
+  COUNT(*)             AS cnt
+FROM labeled
+GROUP BY 1
+"""
+
+def build_preview_sql(scope: str, store_filter: str | None,
+                      a_top: float, a_mid: float, x_low: float, y_mid: float,
+                      limit_n: int) -> str:
+    part_sales = "PARTITION BY store_number " if scope == "store" else ""
+    part_var   = "PARTITION BY store_number " if scope == "store" else ""
+
+    return f"""
+{_base_6m_ctes(store_filter)}
+,ranked AS (
+  SELECT
+    store_number,
+    item_number,
+    total_sales_6m,
+    variance_6m,
+    PERCENT_RANK() OVER ({part_sales} ORDER BY total_sales_6m DESC) AS pr_sales,
+    PERCENT_RANK() OVER ({part_var}   ORDER BY variance_6m  ASC )   AS pr_var
+  FROM agg
+),
+labeled AS (
+  SELECT
+    CAST(store_number AS varchar) AS "Mağaza Kodu",
+    CAST(item_number  AS varchar) AS "Ürün Kodu",
+    total_sales_6m                 AS "Toplam Satış (6 Ay)",
+    variance_6m                    AS "Varyans",
+    CASE WHEN pr_sales <= {a_top} THEN 'A'
+         WHEN pr_sales <= {a_mid} THEN 'B'
+         ELSE 'C' END AS a_class,
+    CASE WHEN pr_var   <= {x_low} THEN 'X'
+         WHEN pr_var   <= {y_mid} THEN 'Y'
+         ELSE 'Z' END AS x_class
+  FROM ranked
+)
+SELECT
+  "Mağaza Kodu",
+  "Ürün Kodu",
+  "Toplam Satış (6 Ay)",
+  "Varyans",
+  (a_class || x_class) AS "ABC-XYZ Sonucu"
+FROM labeled
+ORDER BY "ABC-XYZ Sonucu","Mağaza Kodu","Ürün Kodu"
+LIMIT {int(limit_n)}
+"""
+
+# ==================== Yardımcı: ABCXYZ sayımlarını tam 9 kategoriye yay ====================
+def normalize_counts(df_counts: pd.DataFrame) -> pd.DataFrame:
+    # df_counts: columns [abcxyz, cnt]
+    base = pd.DataFrame({"ABCXYZ": ABCXYZ_ORDER})
+    m = df_counts.copy()
+    m.columns = ["ABCXYZ", "count"]
+    base["count"] = base["ABCXYZ"].map(dict(zip(m["ABCXYZ"], m["count"]))).fillna(0).astype(int)
+    return base
+
+# ==================== Mağaza listesi (hafif) ====================
+@st.cache_data(ttl=15*60, show_spinner=False)
+def load_store_list():
+    sql = """
+    WITH params AS (
+      SELECT date_add('month', -6, current_date) AS start_date, current_date AS end_date
+    )
+    SELECT DISTINCT CAST(store_number AS varchar) AS store_code
+    FROM selfservis_migros.v_daily_store_item_sale s
+    JOIN params p ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
+    """
+    return pd.read_sql(sql, engine)["store_code"].sort_values().tolist()
+
+store_opts = ["(Hepsi)"] + load_store_list()
+sel_store = st.selectbox("Mağaza filtresi", store_opts, index=0)
+
+# ==================== Veri çekme (yalnız sayımlar + opsiyonel önizleme) ====================
+@st.cache_data(ttl=10*60, show_spinner=True)
+def fetch_counts(scope: str, store_code: str | None, a_top: float, a_mid: float, x_low: float, y_mid: float):
+    sql = build_counts_sql(scope, store_code, a_top, a_mid, x_low, y_mid)
+    return pd.read_sql(sql, engine)
+
+@st.cache_data(ttl=10*60, show_spinner=True)
+def fetch_preview(scope: str, store_code: str | None, a_top: float, a_mid: float, x_low: float, y_mid: float, limit_n: int):
+    if limit_n <= 0:
+        return pd.DataFrame()
+    sql = build_preview_sql(scope, store_code, a_top, a_mid, x_low, y_mid, limit_n)
+    return pd.read_sql(sql, engine)
+
+if refresh:
+    fetch_counts.clear()
+    fetch_preview.clear()
+
+counts_raw = fetch_counts(scope_key, None if sel_store == "(Hepsi)" else sel_store,
+                          abc_top, abc_mid, xyz_low, xyz_mid)
+counts = normalize_counts(counts_raw)
+
+# ==================== Grafikler ====================
+tab_charts, tab_table = st.tabs(["📊 Dağılım Grafikleri", "🔎 Önizleme (opsiyonel)"])
+
+with tab_charts:
+    st.subheader("Genel ABC-XYZ dağılımı")
+    fig_all = px.pie(
+        counts, names="ABCXYZ", values="count",
+        category_orders={"ABCXYZ": ABCXYZ_ORDER},
+        hole=0.35, title=f"Seçili filtre için ABC-XYZ dağılımı (6 ay)"
+    )
+    fig_all.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig_all, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("A / B / C içinde X–Y–Z kırılımları")
+    colA, colB, colC = st.columns(3)
+
+    def sub_counts(letter: str):
+        mask = counts["ABCXYZ"].str.startswith(letter)
+        return counts[mask].copy()
+
+    def sub_pie(df_sub: pd.DataFrame, order_list: list[str], col, letter: str):
+        dfv = pd.DataFrame({"ABCXYZ": order_list})
+        dfv["count"] = dfv["ABCXYZ"].map(dict(zip(df_sub["ABCXYZ"], df_sub["count"]))).fillna(0).astype(int)
+        fig = px.pie(
+            dfv, names="ABCXYZ", values="count",
+            category_orders={"ABCXYZ": order_list},
+            hole=0.35, title=f"{letter} sınıfı içinde dağılım"
+        )
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        col.plotly_chart(fig, use_container_width=True)
+
+    sub_pie(sub_counts("A"), ["AX","AY","AZ"], colA, "A")
+    sub_pie(sub_counts("B"), ["BX","BY","BZ"], colB, "B")
+    sub_pie(sub_counts("C"), ["CX","CY","CZ"], colC, "C")
+
+with tab_table:
+    st.subheader(f"Önizleme tablosu (ilk {preview_rows} satır)")
+    if preview_rows == 0:
+        st.info("Önizleme kapalı. Büyük veri setlerinde performans için önerilir.")
+    else:
+        prev = fetch_preview(scope_key, None if sel_store == "(Hepsi)" else sel_store,
+                             abc_top, abc_mid, xyz_low, xyz_mid, preview_rows)
+        if prev.empty:
+            st.warning("Önizleme boş döndü.")
+        else:
+            # Z-çarpan ekle (yalnızca görsel amaçlı)
+            prev["ABC-XYZ'e göre çarpan"] = prev["ABC-XYZ Sonucu"].map(grid_z).fillna(1.0).astype(float).round(2)
+            st.dataframe(prev, use_container_width=True, height=500)
+
+# ==================== İpuçları ====================
+with st.expander("ℹ️ Notlar"):
+    st.markdown("""
+- **Büyük veri için tasarlandı:** Grafik sayıları SQL tarafında hesaplanır, tüm satırlar RAM'e indirilmez.
+- **Scope**:
+  - *Global*: yüzdelikler tüm filtrelenmiş veri üzerinde.
+  - *Mağaza bazında*: yüzdelikler mağaza içinde (SQL'de `PARTITION BY store_number`).
+- **Önizleme** satır sayısını arttırmak yalnızca küçük bir örneği getirir; dağılım her zaman SQL'deki tüm popülasyona göre hesaplanır.
+- Excel indir kaldırıldı; 20M+ satır için uygun değil.
+""")
