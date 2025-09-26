@@ -1,7 +1,7 @@
 # app_abc_xyz_sql.py
 # -*- coding: utf-8 -*-
-# Streamlit: Trino/Presto SQL -> ABC–XYZ (6 ay) • büyük veride ölçeklenebilir (SQL'de sayımlar) • manuel z-çarpan grid
-
+# Streamlit: Trino/Presto SQL -> ABC–XYZ sınıflaması (6 ay) + ayarlanabilir eşikler + manuel çarpan grid
+import io
 import math
 import numpy as np
 import pandas as pd
@@ -12,7 +12,7 @@ import plotly.express as px
 from whitelotus.utils import create_selfservis_connection
 engine = create_selfservis_connection()
 
-# ==================== Sabitler ====================
+# ==================== Ayarlar ====================
 st.set_page_config(page_title="ABC–XYZ (SQL • 6 Ay)", layout="wide")
 st.title("📦 ABC–XYZ Analizi (SQL • Son 6 Ay)")
 st.caption("Kaynak: v_daily_store_item_sale • Varyans günlük satışlar üzerinden (0 satışlı günler dahil).")
@@ -24,62 +24,39 @@ DEFAULT_MULTIPLIER_GRID = {
     "CX": 1.13, "CY": 1.04, "CZ": 0.84,
 }
 
+REQUIRED_COLS = ["Mağaza Kodu", "Ürün Kodu", "Toplam Satış (6 Ay)", "Varyans"]
+
+# ==================== Yardımcılar ====================
 def to_numeric_strict(s: pd.Series) -> pd.Series:
     ser = s.astype(str).str.replace(",", ".", regex=False)
     return pd.to_numeric(ser, errors="coerce").fillna(0)
 
-# ==================== Sidebar ====================
-with st.sidebar:
-    st.header("⚙️ Ayarlar")
+def _percent_rank(series: pd.Series, ascending: bool) -> pd.Series:
+    n = series.shape[0]
+    if n <= 1:
+        return pd.Series(np.zeros(n), index=series.index, dtype=float)
+    r = series.rank(method="average", ascending=ascending)
+    return (r - 1) / (n - 1)
 
-    scope_choice = st.radio(
-        "Yüzde dilimi kapsamı (Scope)",
-        ["Global (tüm mağazalar birlikte)", "Mağaza bazında (her mağaza kendi içinde)"],
-        index=0
-    )
-    scope_key = "global" if scope_choice.startswith("Global") else "store"
+def group_percent_rank(df: pd.DataFrame, value_col: str, ascending: bool, group_cols: list[str] | None):
+    if not group_cols:
+        return _percent_rank(df[value_col], ascending=ascending)
+    return df.groupby(group_cols, group_keys=False)[value_col]\
+             .apply(lambda s: _percent_rank(s, ascending=ascending))
 
-    st.subheader("ABC Eşikleri")
-    abc_top = st.number_input("A üst dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
-    abc_mid = st.number_input("B üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+def classify_from_pr(pr: float, cut1=0.20, cut2=0.60, labels=("A","B","C")) -> str:
+    if pr <= cut1:
+        return labels[0]
+    elif pr <= cut2:
+        return labels[1]
+    else:
+        return labels[2]
 
-    st.subheader("XYZ Eşikleri")
-    xyz_low = st.number_input("X alt dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
-    xyz_mid = st.number_input("Y üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
-
-    st.subheader("Z-Çarpan Grid (AX..CZ)")
-    grid_z = {}
-    cols = st.columns(3)
-    for idx, a in enumerate(["A","B","C"]):
-        with cols[idx]:
-            st.markdown(f"**{a} sınıfı**")
-            for x in ["X","Y","Z"]:
-                key = a + x
-                default = DEFAULT_MULTIPLIER_GRID[key]
-                grid_z[key] = st.number_input(
-                    key, min_value=0.00, max_value=5.00, value=float(default),
-                    step=0.01, format="%.2f", key=f"z_{key}"
-                )
-
-    st.markdown("---")
-    # Büyük veri: yalnızca örnek tablo satır sayısı (0 = hiç getirme)
-    preview_rows = st.number_input("Önizleme satır sayısı (0 = kapalı)", min_value=0, max_value=5000, value=0, step=100)
-
-    st.markdown("---")
-    refresh = st.button("🔄 Veriyi Yenile")
-
-# ==================== SQL inşa yardımcıları ====================
-# Not: 6 ay sabit istendi; istersen months_back parametresiyle dinamik yapabiliriz.
-def _base_6m_ctes(store_filter: str | None) -> str:
-    where_store = ""
-    if store_filter and store_filter != "(Hepsi)":
-        # Trino/Presto: CAST kullanıp = ile filtreliyoruz
-        where_store = f" AND CAST(store_number AS varchar) = '{store_filter.replace(\"'\",\"''\")}' "
-
-    return f"""
+# ==================== SQL Query (yalnızca gerekli alanlar) ====================
+SQL_QUERY = """
 WITH params AS (
   SELECT
-    date_add('month', -6, current_date) AS start_date,
+    date_add('month', -1, current_date) AS start_date,
     current_date                        AS end_date
 ),
 raw AS (
@@ -91,8 +68,6 @@ raw AS (
   FROM selfservis_migros.v_daily_store_item_sale s
   JOIN params p
     ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
-  WHERE 1=1
-  {where_store}
   GROUP BY 1, 2, 3
 ),
 pairs AS (
@@ -122,153 +97,134 @@ daily AS (
     ON r.store_number = g.store_number
    AND r.item_number  = g.item_number
    AND r.tx_date      = g.tx_date
-),
-agg AS (
-  SELECT
-    store_number,
-    item_number,
-    SUM(daily_qty)                AS total_sales_6m,
-    COALESCE(var_pop(daily_qty),0) AS variance_6m
-  FROM daily
-  GROUP BY 1, 2
-)
-"""
-
-def build_counts_sql(scope: str, store_filter: str | None,
-                     a_top: float, a_mid: float, x_low: float, y_mid: float) -> str:
-    # scope=='store' ise percent_rank PARTITION BY store_number
-    part_sales = "PARTITION BY store_number " if scope == "store" else ""
-    part_var   = "PARTITION BY store_number " if scope == "store" else ""
-
-    return f"""
-{_base_6m_ctes(store_filter)}
-,ranked AS (
-  SELECT
-    store_number,
-    item_number,
-    total_sales_6m,
-    variance_6m,
-    PERCENT_RANK() OVER ({part_sales} ORDER BY total_sales_6m DESC) AS pr_sales,
-    PERCENT_RANK() OVER ({part_var}   ORDER BY variance_6m  ASC )   AS pr_var
-  FROM agg
-),
-labeled AS (
-  SELECT
-    store_number,
-    item_number,
-    CASE WHEN pr_sales <= {a_top} THEN 'A'
-         WHEN pr_sales <= {a_mid} THEN 'B'
-         ELSE 'C' END AS a_class,
-    CASE WHEN pr_var   <= {x_low} THEN 'X'
-         WHEN pr_var   <= {y_mid} THEN 'Y'
-         ELSE 'Z' END AS x_class
-  FROM ranked
 )
 SELECT
-  (a_class || x_class) AS abcxyz,
-  COUNT(*)             AS cnt
-FROM labeled
-GROUP BY 1
+  CAST(store_number AS varchar) AS "Mağaza Kodu",
+  CAST(item_number  AS varchar) AS "Ürün Kodu",
+  SUM(daily_qty)                AS "Toplam Satış (6 Ay)",
+  COALESCE(var_pop(daily_qty), 0) AS "Varyans"
+FROM daily
+GROUP BY 1, 2
 """
 
-def build_preview_sql(scope: str, store_filter: str | None,
-                      a_top: float, a_mid: float, x_low: float, y_mid: float,
-                      limit_n: int) -> str:
-    part_sales = "PARTITION BY store_number " if scope == "store" else ""
-    part_var   = "PARTITION BY store_number " if scope == "store" else ""
+# ==================== Cache'li veri çekme ====================
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def load_data():
+    df = pd.read_sql(SQL_QUERY, engine)
+    # Tip temizliği
+    df["Toplam Satış (6 Ay)"] = to_numeric_strict(df["Toplam Satış (6 Ay)"])
+    df["Varyans"] = to_numeric_strict(df["Varyans"])
+    return df
 
-    return f"""
-{_base_6m_ctes(store_filter)}
-,ranked AS (
-  SELECT
-    store_number,
-    item_number,
-    total_sales_6m,
-    variance_6m,
-    PERCENT_RANK() OVER ({part_sales} ORDER BY total_sales_6m DESC) AS pr_sales,
-    PERCENT_RANK() OVER ({part_var}   ORDER BY variance_6m  ASC )   AS pr_var
-  FROM agg
-),
-labeled AS (
-  SELECT
-    CAST(store_number AS varchar) AS "Mağaza Kodu",
-    CAST(item_number  AS varchar) AS "Ürün Kodu",
-    total_sales_6m                 AS "Toplam Satış (6 Ay)",
-    variance_6m                    AS "Varyans",
-    CASE WHEN pr_sales <= {a_top} THEN 'A'
-         WHEN pr_sales <= {a_mid} THEN 'B'
-         ELSE 'C' END AS a_class,
-    CASE WHEN pr_var   <= {x_low} THEN 'X'
-         WHEN pr_var   <= {y_mid} THEN 'Y'
-         ELSE 'Z' END AS x_class
-  FROM ranked
-)
-SELECT
-  "Mağaza Kodu",
-  "Ürün Kodu",
-  "Toplam Satış (6 Ay)",
-  "Varyans",
-  (a_class || x_class) AS "ABC-XYZ Sonucu"
-FROM labeled
-ORDER BY "ABC-XYZ Sonucu","Mağaza Kodu","Ürün Kodu"
-LIMIT {int(limit_n)}
-"""
-
-# ==================== Yardımcı: ABCXYZ sayımlarını tam 9 kategoriye yay ====================
-def normalize_counts(df_counts: pd.DataFrame) -> pd.DataFrame:
-    # df_counts: columns [abcxyz, cnt]
-    base = pd.DataFrame({"ABCXYZ": ABCXYZ_ORDER})
-    m = df_counts.copy()
-    m.columns = ["ABCXYZ", "count"]
-    base["count"] = base["ABCXYZ"].map(dict(zip(m["ABCXYZ"], m["count"]))).fillna(0).astype(int)
-    return base
-
-# ==================== Mağaza listesi (hafif) ====================
-@st.cache_data(ttl=15*60, show_spinner=False)
-def load_store_list():
-    sql = """
-    WITH params AS (
-      SELECT date_add('month', -6, current_date) AS start_date, current_date AS end_date
+with st.sidebar:
+    st.header("⚙️ Ayarlar")
+    scope_choice = st.radio(
+        "Yüzde dilimi kapsamı (Scope)",
+        ["Global (tüm mağazalar birlikte)", "Mağaza bazında (her mağaza kendi içinde)"],
+        index=0
     )
-    SELECT DISTINCT CAST(store_number AS varchar) AS store_code
-    FROM selfservis_migros.v_daily_store_item_sale s
-    JOIN params p ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
-    """
-    return pd.read_sql(sql, engine)["store_code"].sort_values().tolist()
+    scope_key = "global" if scope_choice.startswith("Global") else "store"
 
-store_opts = ["(Hepsi)"] + load_store_list()
+    st.subheader("ABC Eşikleri")
+    abc_top = st.number_input("A üst dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    abc_mid = st.number_input("B üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("XYZ Eşikleri")
+    xyz_low = st.number_input("X alt dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    xyz_mid = st.number_input("Y üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("Z-Çarpan Grid (AX..CZ)")
+    grid_z = {}
+    cols = st.columns(3)
+    defaults = DEFAULT_MULTIPLIER_GRID
+    for idx, a in enumerate(["A", "B", "C"]):
+        with cols[idx]:
+            st.markdown(f"**{a} sınıfı**")
+            for x in ["X", "Y", "Z"]:
+                key = a + x
+                grid_z[key] = st.number_input(
+                    key, min_value=0.00, max_value=5.00, value=float(defaults[key]),
+                    step=0.01, format="%.2f", key=f"z_{key}"
+                )
+
+    st.markdown("---")
+    refresh = st.button("🔄 Veriyi Yenile")
+
+# Veri çek
+if refresh:
+    load_data.clear()  # cache temizle
+df = load_data()
+
+# Giriş doğrulamaları
+missing = [c for c in REQUIRED_COLS if c not in df.columns]
+if missing:
+    st.error(f"Eksik kolonlar: {missing}")
+    st.stop()
+
+# Mağaza filtresi
+store_opts = ["(Hepsi)"] + sorted(df["Mağaza Kodu"].dropna().astype(str).unique().tolist())
 sel_store = st.selectbox("Mağaza filtresi", store_opts, index=0)
 
-# ==================== Veri çekme (yalnız sayımlar + opsiyonel önizleme) ====================
-@st.cache_data(ttl=10*60, show_spinner=True)
-def fetch_counts(scope: str, store_code: str | None, a_top: float, a_mid: float, x_low: float, y_mid: float):
-    sql = build_counts_sql(scope, store_code, a_top, a_mid, x_low, y_mid)
-    return pd.read_sql(sql, engine)
+df_work = df.copy()
+if sel_store != "(Hepsi)":
+    df_work = df_work[df_work["Mağaza Kodu"].astype(str) == str(sel_store)]
 
-@st.cache_data(ttl=10*60, show_spinner=True)
-def fetch_preview(scope: str, store_code: str | None, a_top: float, a_mid: float, x_low: float, y_mid: float, limit_n: int):
-    if limit_n <= 0:
-        return pd.DataFrame()
-    sql = build_preview_sql(scope, store_code, a_top, a_mid, x_low, y_mid, limit_n)
-    return pd.read_sql(sql, engine)
+st.success(f"Veri yüklendi: {len(df_work):,} satır (filtre: {sel_store})")
 
-if refresh:
-    fetch_counts.clear()
-    fetch_preview.clear()
+# ==================== ABC–XYZ Hesaplama ====================
+def compute_abc_xyz_base(
+    df_in: pd.DataFrame,
+    abc_top_cut: float,
+    abc_mid_cut: float,
+    xyz_low_cut: float,
+    xyz_mid_cut: float,
+    scope: str,
+    zgrid: dict
+):
+    out = df_in.copy()
+    out["Toplam Satış (6 Ay)"] = to_numeric_strict(out["Toplam Satış (6 Ay)"])
+    out["Varyans"] = to_numeric_strict(out["Varyans"])
 
-counts_raw = fetch_counts(scope_key, None if sel_store == "(Hepsi)" else sel_store,
-                          abc_top, abc_mid, xyz_low, xyz_mid)
-counts = normalize_counts(counts_raw)
+    # Scope -> group cols
+    if scope == "global":
+        group_cols = None
+    elif scope == "store":
+        group_cols = ["Mağaza Kodu"]
+    else:
+        group_cols = None
 
-# ==================== Grafikler ====================
-tab_charts, tab_table = st.tabs(["📊 Dağılım Grafikleri", "🔎 Önizleme (opsiyonel)"])
+    # ABC: satış DESC
+    pr_sales = group_percent_rank(out, "Toplam Satış (6 Ay)", ascending=False, group_cols=group_cols)
+    ABC = pr_sales.apply(lambda v: classify_from_pr(v, abc_top_cut, abc_mid_cut, ("A", "B", "C")))
+
+    # XYZ: varyans ASC
+    pr_var = group_percent_rank(out, "Varyans", ascending=True, group_cols=group_cols)
+    XYZ = pr_var.apply(lambda v: classify_from_pr(v, xyz_low_cut, xyz_mid_cut, ("X", "Y", "Z")))
+
+    out["ABC-XYZ Sonucu"] = (ABC + XYZ).astype(str)
+    out["ABC-XYZ'e göre çarpan"] = out["ABC-XYZ Sonucu"].map(zgrid).fillna(1.0).astype(float).round(2)
+    return out
+
+out = compute_abc_xyz_base(
+    df_work,
+    abc_top_cut=abc_top, abc_mid_cut=abc_mid,
+    xyz_low_cut=xyz_low, xyz_mid_cut=xyz_mid,
+    scope=scope_key, zgrid=grid_z
+)
+
+# ==================== Görseller ve Tablo ====================
+tab_charts, tab_table = st.tabs(["📊 Dağılım Grafikleri", "🔎 Sonuç Tablosu"])
 
 with tab_charts:
     st.subheader("Genel ABC-XYZ dağılımı")
+    vc_all = out["ABC-XYZ Sonucu"].astype(str).value_counts()
+    df_all = pd.DataFrame({"ABCXYZ": ABCXYZ_ORDER})
+    df_all["count"] = df_all["ABCXYZ"].map(vc_all).fillna(0).astype(int)
+
     fig_all = px.pie(
-        counts, names="ABCXYZ", values="count",
+        df_all, names="ABCXYZ", values="count",
         category_orders={"ABCXYZ": ABCXYZ_ORDER},
-        hole=0.35, title=f"Seçili filtre için ABC-XYZ dağılımı (6 ay)"
+        hole=0.35, title="Seçili filtre için ABC-XYZ dağılımı"
     )
     fig_all.update_traces(textposition="inside", textinfo="percent+label")
     st.plotly_chart(fig_all, use_container_width=True)
@@ -277,46 +233,41 @@ with tab_charts:
     st.subheader("A / B / C içinde X–Y–Z kırılımları")
     colA, colB, colC = st.columns(3)
 
-    def sub_counts(letter: str):
-        mask = counts["ABCXYZ"].str.startswith(letter)
-        return counts[mask].copy()
-
-    def sub_pie(df_sub: pd.DataFrame, order_list: list[str], col, letter: str):
-        dfv = pd.DataFrame({"ABCXYZ": order_list})
-        dfv["count"] = dfv["ABCXYZ"].map(dict(zip(df_sub["ABCXYZ"], df_sub["count"]))).fillna(0).astype(int)
+    def sub_pie(letter: str, order_list: list[str], col):
+        sub = out[out["ABC-XYZ Sonucu"].str.startswith(letter)]
+        vc = sub["ABC-XYZ Sonucu"].astype(str).value_counts()
+        dfx = pd.DataFrame({"ABCXYZ": order_list})
+        dfx["count"] = dfx["ABCXYZ"].map(vc).fillna(0).astype(int)
         fig = px.pie(
-            dfv, names="ABCXYZ", values="count",
+            dfx, names="ABCXYZ", values="count",
             category_orders={"ABCXYZ": order_list},
             hole=0.35, title=f"{letter} sınıfı içinde dağılım"
         )
         fig.update_traces(textposition="inside", textinfo="percent+label")
         col.plotly_chart(fig, use_container_width=True)
 
-    sub_pie(sub_counts("A"), ["AX","AY","AZ"], colA, "A")
-    sub_pie(sub_counts("B"), ["BX","BY","BZ"], colB, "B")
-    sub_pie(sub_counts("C"), ["CX","CY","CZ"], colC, "C")
+    sub_pie("A", ["AX", "AY", "AZ"], colA)
+    sub_pie("B", ["BX", "BY", "BZ"], colB)
+    sub_pie("C", ["CX", "CY", "CZ"], colC)
 
 with tab_table:
-    st.subheader(f"Önizleme tablosu (ilk {preview_rows} satır)")
-    if preview_rows == 0:
-        st.info("Önizleme kapalı. Büyük veri setlerinde performans için önerilir.")
-    else:
-        prev = fetch_preview(scope_key, None if sel_store == "(Hepsi)" else sel_store,
-                             abc_top, abc_mid, xyz_low, xyz_mid, preview_rows)
-        if prev.empty:
-            st.warning("Önizleme boş döndü.")
-        else:
-            # Z-çarpan ekle (yalnızca görsel amaçlı)
-            prev["ABC-XYZ'e göre çarpan"] = prev["ABC-XYZ Sonucu"].map(grid_z).fillna(1.0).astype(float).round(2)
-            st.dataframe(prev, use_container_width=True, height=500)
+    st.subheader("Sonuçlar")
+    # Kategori sırası
+    cat_order = pd.api.types.CategoricalDtype(categories=ABCXYZ_ORDER, ordered=True)
+    preview_df = out.copy()
+    preview_df["ABC-XYZ Sonucu"] = preview_df["ABC-XYZ Sonucu"].astype(cat_order)
+
+    show_cols = ["Mağaza Kodu", "Ürün Kodu", "Toplam Satış (6 Ay)", "Varyans", "ABC-XYZ Sonucu", "ABC-XYZ'e göre çarpan"]
+    sort_cols = ["ABC-XYZ Sonucu", "Mağaza Kodu", "Ürün Kodu"]
+    preview_df = preview_df.sort_values(sort_cols, na_position="last")
+    st.dataframe(preview_df[show_cols].head(200), use_container_width=True)
 
 # ==================== İpuçları ====================
 with st.expander("ℹ️ Notlar"):
     st.markdown("""
-- **Büyük veri için tasarlandı:** Grafik sayıları SQL tarafında hesaplanır, tüm satırlar RAM'e indirilmez.
-- **Scope**:
-  - *Global*: yüzdelikler tüm filtrelenmiş veri üzerinde.
-  - *Mağaza bazında*: yüzdelikler mağaza içinde (SQL'de `PARTITION BY store_number`).
-- **Önizleme** satır sayısını arttırmak yalnızca küçük bir örneği getirir; dağılım her zaman SQL'deki tüm popülasyona göre hesaplanır.
-- Excel indir kaldırıldı; 20M+ satır için uygun değil.
+- **Scope** seçimi:
+  - *Global*: tüm mağaza-ürünleri birlikte sıralar (tek evrensel percentile).
+  - *Mağaza bazında*: her mağaza kendi içindeki dağılıma göre A/B ve X/Y/Z ataması alır.
+- Z-çarpanları elle girdiğin grid sonuç sütununa doğrudan yazılır.
+- Çok büyük veri için grafikler öncesi mağaza filtresi kullanman performansı artırır.
 """)
