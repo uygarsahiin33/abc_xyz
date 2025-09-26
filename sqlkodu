@@ -1,38 +1,32 @@
--- TRINO / PRESTO: Ürün Kodu | Toplam Satış | Varyans | ABC-XYZ Sonucu | Çarpanı
+-- Ürün Kodu | Toplam Satış | Varyans | ABC-XYZ Sonucu | Çarpanı
 WITH params AS (
   SELECT
-    date_add('month', -6, current_date) AS start_date,   -- tam 180 gün istersen: date_add('day', -180, current_date)
+    date_add('day', -180, current_date) AS start_date,   -- son 180 gün
     current_date                        AS end_date
 ),
-
--- 1) Her gün + ürün için TÜM mağazalardaki satışların toplamı
+-- 1) Gün+ürün: TÜM mağazalardaki satışların gün içi toplamı
 raw_daily_item AS (
   SELECT
     CAST(date_of_transaction AS date) AS tx_date,
     item_number,
     SUM(quantity_sold) AS qty_daily_allstores
-  FROM selfservis_migros.v_daily_store_item_sale s
+  FROM nessie.selfservis_migros.v_daily_store_item_sale s
   JOIN params p
     ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
   GROUP BY 1, 2
 ),
-
--- 2) Takvim ve ürün evreni (sıfır satış günlerini doldurmak için)
+-- 2) Takvim x ürün (0 satış günlerini doldurmak için)
 items AS ( SELECT DISTINCT item_number FROM raw_daily_item ),
 calendar AS (
   SELECT d AS tx_date
-  FROM (
-    SELECT sequence(p.start_date, p.end_date, interval '1' day) AS days
-    FROM params p
-  )
-  CROSS JOIN UNNEST(days) AS u(d)
+  FROM params p
+  CROSS JOIN UNNEST(sequence(p.start_date, p.end_date, interval '1' day)) AS t(d)
 ),
 grid AS (
   SELECT c.tx_date, it.item_number
   FROM calendar c
   CROSS JOIN items it
 ),
-
 -- 3) Eksik günleri 0 ile doldur
 daily AS (
   SELECT
@@ -44,34 +38,30 @@ daily AS (
     ON r.item_number = g.item_number
    AND r.tx_date     = g.tx_date
 ),
-
--- 4) 6 ay toplam satış + günlük toplamların std karesinden varyans
+-- 4) 180 günde toplam satış + günlük toplamların stddev_pop^2 ile varyans
 agg AS (
   SELECT
     item_number,
-    SUM(daily_qty)                                   AS total_sales_6m,
-    POWER(stddev_pop(daily_qty), 2)                  AS variance_6m   -- stddev_pop^2 = var_pop
+    SUM(daily_qty)                              AS total_sales_180d,
+    POWER(stddev_pop(daily_qty), 2)             AS variance_180d   -- stddev_pop^2 = var_pop
   FROM daily
   GROUP BY 1
 ),
-
--- 5) Yüzdelik sıralamalar (global)
+-- 5) Global yüzdelikler (satış DESC → A; varyans DESC → X)
 ranked AS (
   SELECT
     item_number,
-    total_sales_6m,
-    variance_6m,
-    PERCENT_RANK() OVER (ORDER BY total_sales_6m DESC) AS pr_sales, -- 0 = en çok satan
-    PERCENT_RANK() OVER (ORDER BY variance_6m  DESC)    AS pr_var    -- 0 = en yüksek varyans
+    total_sales_180d,
+    variance_180d,
+    PERCENT_RANK() OVER (ORDER BY total_sales_180d DESC) AS pr_sales,
+    PERCENT_RANK() OVER (ORDER BY variance_180d  DESC)    AS pr_var
   FROM agg
 ),
-
--- 6) ABC ve XYZ etiketleri
 labeled AS (
   SELECT
     item_number,
-    total_sales_6m,
-    variance_6m,
+    total_sales_180d,
+    variance_180d,
     CASE
       WHEN pr_sales <= 0.20 THEN 'A'
       WHEN pr_sales <= 0.60 THEN 'B'
@@ -84,13 +74,11 @@ labeled AS (
     END AS x_class
   FROM ranked
 )
-
--- 7) Nihai çıktı + çarpan eşlemesi
 SELECT
-  CAST(item_number AS varchar)               AS "Ürün Kodu",
-  total_sales_6m                              AS "Toplam Satış",
-  variance_6m                                 AS "Varyans",
-  (a_class || x_class)                        AS "ABC-XYZ Sonucu",
+  CAST(item_number AS varchar)            AS "Ürün Kodu",
+  total_sales_180d                        AS "Toplam Satış",
+  variance_180d                           AS "Varyans",
+  (a_class || x_class)                    AS "ABC-XYZ Sonucu",
   CASE (a_class || x_class)
     WHEN 'AX' THEN 1.88
     WHEN 'AY' THEN 1.64
@@ -102,7 +90,7 @@ SELECT
     WHEN 'CY' THEN 1.04
     WHEN 'CZ' THEN 0.84
     ELSE 1.00
-  END                                         AS "Çarpanı"
+  END                                      AS "Çarpanı"
 FROM labeled
 ORDER BY
   CASE (a_class || x_class)
