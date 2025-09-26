@@ -1,7 +1,6 @@
 # app_abc_xyz_sql.py
 # -*- coding: utf-8 -*-
 # Streamlit: Trino/Presto SQL -> ABC–XYZ sınıflaması (6 ay) + ayarlanabilir eşikler + manuel çarpan grid
-import io
 import math
 import numpy as np
 import pandas as pd
@@ -53,10 +52,11 @@ def classify_from_pr(pr: float, cut1=0.20, cut2=0.60, labels=("A","B","C")) -> s
         return labels[2]
 
 # ==================== SQL Query (yalnızca gerekli alanlar) ====================
+# DÜZELTİLDİ: -1 AY -> -6 AY
 SQL_QUERY = """
 WITH params AS (
   SELECT
-    date_add('month', -1, current_date) AS start_date,
+    date_add('month', -6, current_date) AS start_date,
     current_date                        AS end_date
 ),
 raw AS (
@@ -133,6 +133,14 @@ with st.sidebar:
     xyz_low = st.number_input("X alt dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
     xyz_mid = st.number_input("Y üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
 
+    # YENİ: XYZ metrik seçimi
+    xyz_metric = st.radio(
+        "XYZ metriği",
+        ["CV (σ/μ) — önerilir", "Varyans (ham)"],
+        index=0,
+        help="Varyans hacimle artar; CV (std/mean) hacim etkisini dengeler ve daha adil bir XYZ verir."
+    )
+
     st.subheader("Z-Çarpan Grid (AX..CZ)")
     grid_z = {}
     cols = st.columns(3)
@@ -179,7 +187,8 @@ def compute_abc_xyz_base(
     xyz_low_cut: float,
     xyz_mid_cut: float,
     scope: str,
-    zgrid: dict
+    zgrid: dict,
+    xyz_metric_kind: str = "cv"  # "cv" veya "var"
 ):
     out = df_in.copy()
     out["Toplam Satış (6 Ay)"] = to_numeric_strict(out["Toplam Satış (6 Ay)"])
@@ -197,10 +206,22 @@ def compute_abc_xyz_base(
     pr_sales = group_percent_rank(out, "Toplam Satış (6 Ay)", ascending=False, group_cols=group_cols)
     ABC = pr_sales.apply(lambda v: classify_from_pr(v, abc_top_cut, abc_mid_cut, ("A", "B", "C")))
 
-    # XYZ: varyans ASC
-    pr_var = group_percent_rank(out, "Varyans", ascending=True, group_cols=group_cols)
-    XYZ = pr_var.apply(lambda v: classify_from_pr(v, xyz_low_cut, xyz_mid_cut, ("X", "Y", "Z")))
+    # XYZ: varyans ASC (tercihen CV ile)
+    if xyz_metric_kind == "cv":
+        # 6 aylık yaklaşık gün sayısı (tüm kayıtlar için aynı)
+        today = pd.Timestamp.today().normalize()
+        start = (today - pd.DateOffset(months=6)).normalize()
+        ndays = max((today - start).days + 1, 1)
+        mean_daily = out["Toplam Satış (6 Ay)"] / ndays
+        std_daily = np.sqrt(out["Varyans"])
+        metric = std_daily / mean_daily.replace(0, np.nan)
+        metric = metric.replace([np.inf, -np.inf], np.nan).fillna(metric.max(skipna=True) or 0)
+        out["_xyz_metric_"] = metric
+        pr_var = group_percent_rank(out, "_xyz_metric_", ascending=True, group_cols=group_cols)
+    else:
+        pr_var = group_percent_rank(out, "Varyans", ascending=True, group_cols=group_cols)
 
+    XYZ = pr_var.apply(lambda v: classify_from_pr(v, xyz_low_cut, xyz_mid_cut, ("X", "Y", "Z")))
     out["ABC-XYZ Sonucu"] = (ABC + XYZ).astype(str)
     out["ABC-XYZ'e göre çarpan"] = out["ABC-XYZ Sonucu"].map(zgrid).fillna(1.0).astype(float).round(2)
     return out
@@ -209,7 +230,8 @@ out = compute_abc_xyz_base(
     df_work,
     abc_top_cut=abc_top, abc_mid_cut=abc_mid,
     xyz_low_cut=xyz_low, xyz_mid_cut=xyz_mid,
-    scope=scope_key, zgrid=grid_z
+    scope=scope_key, zgrid=grid_z,
+    xyz_metric_kind=("cv" if xyz_metric.startswith("CV") else "var")
 )
 
 # ==================== Görseller ve Tablo ====================
@@ -261,13 +283,3 @@ with tab_table:
     sort_cols = ["ABC-XYZ Sonucu", "Mağaza Kodu", "Ürün Kodu"]
     preview_df = preview_df.sort_values(sort_cols, na_position="last")
     st.dataframe(preview_df[show_cols].head(200), use_container_width=True)
-
-# ==================== İpuçları ====================
-with st.expander("ℹ️ Notlar"):
-    st.markdown("""
-- **Scope** seçimi:
-  - *Global*: tüm mağaza-ürünleri birlikte sıralar (tek evrensel percentile).
-  - *Mağaza bazında*: her mağaza kendi içindeki dağılıma göre A/B ve X/Y/Z ataması alır.
-- Z-çarpanları elle girdiğin grid sonuç sütununa doğrudan yazılır.
-- Çok büyük veri için grafikler öncesi mağaza filtresi kullanman performansı artırır.
-""")
