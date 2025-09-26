@@ -1,0 +1,214 @@
+# app_abc_xyz_sql.py
+# -*- coding: utf-8 -*-
+# Streamlit: Trino/Presto SQL -> Ürün bazında (tüm mağazalar toplamı) ABC–XYZ (6 ay)
+# Günlük toplam (ülke/genel) -> 6 aylık dönemde günlük toplamların varyansı
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+
+# ==================== Bağlantı ====================
+from whitelotus.utils import create_selfservis_connection
+engine = create_selfservis_connection()
+
+# ==================== UI ====================
+st.set_page_config(page_title="ABC–XYZ (Global • 6 Ay)", layout="wide")
+st.title("📦 ABC–XYZ Analizi — Ürün Bazında (Tüm Mağazalar Toplamı)")
+st.caption("Kaynak: v_daily_store_item_sale • Her gün tüm mağazalardaki satışlar toplanır; 6 ay içindeki günlük toplamların varyansı kullanılır.")
+
+ABCXYZ_ORDER = ["AX","AY","AZ","BX","BY","BZ","CX","CY","CZ"]
+DEFAULT_MULTIPLIER_GRID = {
+    "AX": 1.88, "AY": 1.64, "AZ": 1.48,
+    "BX": 1.34, "BY": 1.28, "BZ": 1.23,
+    "CX": 1.13, "CY": 1.04, "CZ": 0.84,
+}
+REQUIRED_COLS = ["Ürün Kodu", "Toplam Satış (6 Ay)", "Varyans"]
+
+# ==================== Yardımcılar ====================
+def to_numeric_strict(s: pd.Series) -> pd.Series:
+    ser = s.astype(str).str.replace(",", ".", regex=False)
+    return pd.to_numeric(ser, errors="coerce").fillna(0)
+
+def _percent_rank(series: pd.Series, ascending: bool) -> pd.Series:
+    n = series.shape[0]
+    if n <= 1:
+        return pd.Series(np.zeros(n), index=series.index, dtype=float)
+    r = series.rank(method="average", ascending=ascending)
+    return (r - 1) / (n - 1)
+
+def classify_from_pr(pr: float, cut1=0.20, cut2=0.60, labels=("A","B","C")) -> str:
+    if pr <= cut1:
+        return labels[0]
+    elif pr <= cut2:
+        return labels[1]
+    else:
+        return labels[2]
+
+# ==================== SQL (ürün bazında, tüm mağazalar günlük toplam) ====================
+# Günlük toplam = aynı gün içinde tüm mağazalardaki quantity_sold toplami
+SQL_QUERY = """
+WITH params AS (
+  SELECT
+    date_add('month', -6, current_date) AS start_date,
+    current_date                        AS end_date
+),
+raw_daily_item AS (
+  SELECT
+    CAST(date_of_transaction AS date) AS tx_date,
+    item_number,
+    SUM(quantity_sold) AS qty_daily_allstores
+  FROM selfservis_migros.v_daily_store_item_sale s
+  JOIN params p
+    ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
+  GROUP BY 1, 2
+),
+items AS ( SELECT DISTINCT item_number FROM raw_daily_item ),
+calendar AS (
+  SELECT d AS tx_date
+  FROM (
+    SELECT sequence(p.start_date, p.end_date, interval '1' day) AS days
+    FROM params p
+  )
+  CROSS JOIN UNNEST(days) AS u(d)
+),
+grid AS (
+  SELECT c.tx_date, it.item_number
+  FROM calendar c
+  CROSS JOIN items it
+),
+daily AS (
+  SELECT
+    g.item_number,
+    g.tx_date,
+    COALESCE(r.qty_daily_allstores, 0) AS daily_qty
+  FROM grid g
+  LEFT JOIN raw_daily_item r
+    ON r.item_number = g.item_number
+   AND r.tx_date     = g.tx_date
+),
+agg AS (
+  SELECT
+    item_number,
+    SUM(daily_qty)                 AS total_sales_6m,
+    COALESCE(var_pop(daily_qty),0) AS variance_6m
+  FROM daily
+  GROUP BY 1
+)
+SELECT
+  CAST(item_number AS varchar) AS "Ürün Kodu",
+  total_sales_6m               AS "Toplam Satış (6 Ay)",
+  variance_6m                  AS "Varyans"
+FROM agg
+"""
+
+# ==================== Sidebar ====================
+with st.sidebar:
+    st.header("⚙️ Ayarlar (Global)")
+    st.subheader("ABC Eşikleri")
+    abc_top = st.number_input("A üst dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    abc_mid = st.number_input("B üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("XYZ Eşikleri (Varyans, yüksek -> X)")
+    xyz_top = st.number_input("X üst dilim (%)", min_value=5.0, max_value=50.0, value=20.0, step=1.0) / 100.0
+    xyz_mid = st.number_input("Y üst dilim (%)", min_value=30.0, max_value=90.0, value=60.0, step=1.0) / 100.0
+
+    st.subheader("Z-Çarpan Grid (AX..CZ)")
+    grid_z = {}
+    cols = st.columns(3)
+    for idx, a in enumerate(["A","B","C"]):
+        with cols[idx]:
+            st.markdown(f"**{a} sınıfı**")
+            for x in ["X","Y","Z"]:
+                key = a + x
+                grid_z[key] = st.number_input(
+                    key, min_value=0.00, max_value=5.00, value=float(DEFAULT_MULTIPLIER_GRID[key]),
+                    step=0.01, format="%.2f", key=f"z_{key}"
+                )
+
+    st.markdown("---")
+    refresh = st.button("🔄 Veriyi Yenile")
+
+# ==================== Veri çekme ====================
+@st.cache_data(ttl=15*60, show_spinner=False)
+def load_data():
+    df = pd.read_sql(SQL_QUERY, engine)
+    df["Toplam Satış (6 Ay)"] = to_numeric_strict(df["Toplam Satış (6 Ay)"])
+    df["Varyans"] = to_numeric_strict(df["Varyans"])
+    return df
+
+if refresh:
+    load_data.clear()
+df = load_data()
+
+# Giriş doğrulama
+missing = [c for c in REQUIRED_COLS if c not in df.columns]
+if missing:
+    st.error(f"Eksik kolon(lar): {missing}")
+    st.stop()
+
+st.success(f"Veri yüklendi: {len(df):,} ürün")
+
+# ==================== ABC–XYZ (global) ====================
+def compute_abc_xyz_global(df_in: pd.DataFrame,
+                           abc_top_cut: float, abc_mid_cut: float,
+                           xyz_top_cut: float, xyz_mid_cut: float,
+                           zgrid: dict) -> pd.DataFrame:
+    out = df_in.copy()
+    # ABC: satış DESC (yüksek hacim A)
+    pr_sales = _percent_rank(out["Toplam Satış (6 Ay)"], ascending=False)
+    A = pr_sales.apply(lambda v: classify_from_pr(v, abc_top_cut, abc_mid_cut, ("A","B","C")))
+    # XYZ: varyans DESC (yüksek varyans X)
+    pr_var = _percent_rank(out["Varyans"], ascending=False)
+    X = pr_var.apply(lambda v: classify_from_pr(v, xyz_top_cut, xyz_mid_cut, ("X","Y","Z")))
+    out["ABC-XYZ Sonucu"] = (A + X).astype(str)
+    out["ABC-XYZ'e göre çarpan"] = out["ABC-XYZ Sonucu"].map(zgrid).fillna(1.0).astype(float).round(2)
+    return out
+
+out = compute_abc_xyz_global(df, abc_top, abc_mid, xyz_top, xyz_mid, grid_z)
+
+# ==================== Grafikleri ve Tabloyu Göster ====================
+tab_charts, tab_table = st.tabs(["📊 Dağılım Grafikleri", "🔎 Sonuç Tablosu"])
+
+with tab_charts:
+    st.subheader("Genel ABC-XYZ dağılımı")
+    vc_all = out["ABC-XYZ Sonucu"].astype(str).value_counts()
+    df_all = pd.DataFrame({"ABCXYZ": ABCXYZ_ORDER})
+    df_all["count"] = df_all["ABCXYZ"].map(vc_all).fillna(0).astype(int)
+    fig_all = px.pie(
+        df_all, names="ABCXYZ", values="count",
+        category_orders={"ABCXYZ": ABCXYZ_ORDER},
+        hole=0.35, title="ABC-XYZ dağılımı (global)"
+    )
+    fig_all.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig_all, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("A / B / C içinde X–Y–Z kırılımları")
+    colA, colB, colC = st.columns(3)
+
+    def sub_pie(letter: str, order_list: list[str], col):
+        sub = out[out["ABC-XYZ Sonucu"].str.startswith(letter)]
+        vc = sub["ABC-XYZ Sonucu"].astype(str).value_counts()
+        dfx = pd.DataFrame({"ABCXYZ": order_list})
+        dfx["count"] = dfx["ABCXYZ"].map(vc).fillna(0).astype(int)
+        fig = px.pie(
+            dfx, names="ABCXYZ", values="count",
+            category_orders={"ABCXYZ": order_list},
+            hole=0.35, title=f"{letter} sınıfı içinde dağılım"
+        )
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        col.plotly_chart(fig, use_container_width=True)
+
+    sub_pie("A", ["AX","AY","AZ"], colA)
+    sub_pie("B", ["BX","BY","BZ"], colB)
+    sub_pie("C", ["CX","CY","CZ"], colC)
+
+with tab_table:
+    st.subheader("Sonuçlar (ilk 200)")
+    cat_order = pd.api.types.CategoricalDtype(categories=ABCXYZ_ORDER, ordered=True)
+    preview_df = out.copy()
+    preview_df["ABC-XYZ Sonucu"] = preview_df["ABC-XYZ Sonucu"].astype(cat_order)
+    show_cols = ["Ürün Kodu","Toplam Satış (6 Ay)","Varyans","ABC-XYZ Sonucu","ABC-XYZ'e göre çarpan"]
+    preview_df = preview_df.sort_values(["ABC-XYZ Sonucu","Ürün Kodu"], na_position="last")
+    st.dataframe(preview_df[show_cols].head(200), use_container_width=True)
