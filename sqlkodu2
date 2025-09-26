@@ -1,0 +1,112 @@
+WITH params AS (
+  SELECT
+    date_add('day', -180, current_date) AS start_date,
+    current_date                        AS end_date
+),
+
+-- 1) Gün + ürün: TÜM mağazalarda günlük toplam satış
+raw_daily_item AS (
+  SELECT
+    CAST(date_of_transaction AS date) AS tx_date,
+    item_number,
+    SUM(quantity_sold) AS qty_daily_allstores
+  FROM nessie.selfservis_migros.v_daily_store_item_sale s
+  JOIN params p
+    ON CAST(date_of_transaction AS date) BETWEEN p.start_date AND p.end_date
+  GROUP BY 1, 2
+),
+
+-- 2) Takvim × ürün (0 satış günlerini doldurmak için)
+items AS ( SELECT DISTINCT item_number FROM raw_daily_item ),
+calendar AS (
+  SELECT d AS tx_date
+  FROM params p
+  CROSS JOIN UNNEST(sequence(p.start_date, p.end_date, interval '1' day)) AS t(d)
+),
+grid AS (
+  SELECT c.tx_date, it.item_number
+  FROM calendar c
+  CROSS JOIN items it
+),
+
+-- 3) Eksik günleri 0 ile doldur
+daily AS (
+  SELECT
+    g.item_number,
+    g.tx_date,
+    COALESCE(r.qty_daily_allstores, 0) AS daily_qty
+  FROM grid g
+  LEFT JOIN raw_daily_item r
+    ON r.item_number = g.item_number
+   AND r.tx_date     = g.tx_date
+),
+
+-- 4) 180 gün toplam satış + günlük varyans
+agg AS (
+  SELECT
+    item_number,
+    SUM(daily_qty)           AS total_sales_180d,
+    var_pop(daily_qty)       AS variance_180d         -- stddev_pop^2 ile aynı
+  FROM daily
+  GROUP BY 1
+),
+
+-- 5) Basit ABC ve XYZ sıralaması (NTILE(5) ile 20/40/40 dilimleri)
+bucketed AS (
+  SELECT
+    item_number,
+    total_sales_180d,
+    variance_180d,
+    NTILE(5) OVER (ORDER BY total_sales_180d DESC) AS sales_q5,
+    NTILE(5) OVER (ORDER BY variance_180d  DESC)   AS var_q5
+  FROM agg
+),
+
+labeled AS (
+  SELECT
+    item_number,
+    total_sales_180d,
+    variance_180d,
+    CASE
+      WHEN sales_q5 = 1 THEN 'A'
+      WHEN sales_q5 IN (2,3) THEN 'B'
+      ELSE 'C'
+    END AS a_class,
+    CASE
+      WHEN var_q5 = 1 THEN 'X'
+      WHEN var_q5 IN (2,3) THEN 'Y'
+      ELSE 'Z'
+    END AS x_class
+  FROM bucketed
+),
+
+final AS (
+  SELECT
+    CAST(item_number AS varchar)         AS "Ürün Kodu",
+    total_sales_180d                     AS "Toplam Satış",
+    variance_180d                        AS "Varyans",
+    (a_class || x_class)                 AS "ABC-XYZ Sonucu",
+    CASE (a_class || x_class)
+      WHEN 'AX' THEN 1.88
+      WHEN 'AY' THEN 1.64
+      WHEN 'AZ' THEN 1.48
+      WHEN 'BX' THEN 1.34
+      WHEN 'BY' THEN 1.28
+      WHEN 'BZ' THEN 1.23
+      WHEN 'CX' THEN 1.13
+      WHEN 'CY' THEN 1.04
+      WHEN 'CZ' THEN 0.84
+      ELSE 1.00
+    END                                  AS "Çarpanı"
+  FROM labeled
+)
+
+SELECT *
+FROM final
+ORDER BY
+  CASE "ABC-XYZ Sonucu"
+    WHEN 'AX' THEN 1 WHEN 'AY' THEN 2 WHEN 'AZ' THEN 3
+    WHEN 'BX' THEN 4 WHEN 'BY' THEN 5 WHEN 'BZ' THEN 6
+    WHEN 'CX' THEN 7 WHEN 'CY' THEN 8 WHEN 'CZ' THEN 9
+    ELSE 10 END,
+  "Ürün Kodu";
