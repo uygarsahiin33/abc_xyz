@@ -1,0 +1,108 @@
+-- 6 aylık periyot + doğru varyans için sıfırlarla gün doldurma
+WITH params AS (
+  SELECT
+    (CURRENT_DATE - INTERVAL '6 months')::date AS start_date,
+    CURRENT_DATE::date                       AS end_date
+),
+raw AS (
+  SELECT
+    DATE(date_of_transaction) AS tx_date,
+    store_number,
+    item_number,
+    SUM(quantity_sold) AS qty
+  FROM selfservis_migros.v_daily_store_item_sale s, params p
+  WHERE date_of_transaction >= p.start_date
+    AND date_of_transaction <  (p.end_date + INTERVAL '1 day')
+  GROUP BY 1,2,3
+),
+pairs AS (
+  SELECT DISTINCT store_number, item_number FROM raw
+),
+calendar AS (
+  SELECT generate_series(
+           (SELECT start_date FROM params),
+           (SELECT end_date   FROM params),
+           INTERVAL '1 day'
+         )::date AS tx_date
+),
+grid AS (
+  SELECT c.tx_date, pr.store_number, pr.item_number
+  FROM calendar c
+  CROSS JOIN pairs pr
+),
+daily AS (
+  SELECT
+    g.store_number,
+    g.item_number,
+    g.tx_date,
+    COALESCE(r.qty, 0) AS daily_qty
+  FROM grid g
+  LEFT JOIN raw r
+    ON r.store_number = g.store_number
+   AND r.item_number  = g.item_number
+   AND r.tx_date      = g.tx_date
+),
+agg AS (
+  SELECT
+    store_number,
+    item_number,
+    SUM(daily_qty)              AS total_sales_6m,
+    COALESCE(VAR_POP(daily_qty),0) AS variance_6m
+  FROM daily
+  GROUP BY 1,2
+),
+ranked AS (
+  SELECT
+    store_number,
+    item_number,
+    total_sales_6m,
+    variance_6m,
+    PERCENT_RANK() OVER (ORDER BY total_sales_6m DESC) AS pr_sales,
+    PERCENT_RANK() OVER (ORDER BY variance_6m  ASC)    AS pr_var
+  FROM agg
+),
+labeled AS (
+  SELECT
+    store_number,
+    item_number,
+    total_sales_6m,
+    variance_6m,
+    CASE WHEN pr_sales <= 0.20 THEN 'A'
+         WHEN pr_sales <= 0.60 THEN 'B'
+         ELSE 'C' END AS a_class,
+    CASE WHEN pr_var   <= 0.20 THEN 'X'
+         WHEN pr_var   <= 0.60 THEN 'Y'
+         ELSE 'Z' END AS x_class
+  FROM ranked
+),
+final AS (
+  SELECT
+    store_number::text AS "Mağaza Kodu",
+    item_number::text  AS "Ürün Kodu",
+    total_sales_6m     AS "Toplam Satış (6 Ay)",
+    variance_6m        AS "Varyans",
+    (a_class || x_class) AS "ABC-XYZ Sonucu",
+    CASE (a_class || x_class)
+      WHEN 'AX' THEN 1.88
+      WHEN 'AY' THEN 1.64
+      WHEN 'AZ' THEN 1.48
+      WHEN 'BX' THEN 1.34
+      WHEN 'BY' THEN 1.28
+      WHEN 'BZ' THEN 1.23
+      WHEN 'CX' THEN 1.13
+      WHEN 'CY' THEN 1.04
+      WHEN 'CZ' THEN 0.84
+      ELSE 1.00
+    END AS "ABC-XYZ'e göre çarpan"
+  FROM labeled
+)
+SELECT *
+FROM final
+ORDER BY
+  CASE "ABC-XYZ Sonucu"
+    WHEN 'AX' THEN 1 WHEN 'AY' THEN 2 WHEN 'AZ' THEN 3
+    WHEN 'BX' THEN 4 WHEN 'BY' THEN 5 WHEN 'BZ' THEN 6
+    WHEN 'CX' THEN 7 WHEN 'CY' THEN 8 WHEN 'CZ' THEN 9
+    ELSE 10 END,
+  "Mağaza Kodu",
+  "Ürün Kodu";
